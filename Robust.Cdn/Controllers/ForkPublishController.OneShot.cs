@@ -1,6 +1,7 @@
 ﻿using System.IO.Compression;
 using Microsoft.AspNetCore.Mvc;
 using Robust.Cdn.Helpers;
+using Robust.Cdn.Services;
 
 namespace Robust.Cdn.Controllers;
 
@@ -25,8 +26,13 @@ public sealed partial class ForkPublishController
         if (!ValidVersionRegex.IsMatch(request.Version))
             return BadRequest("Invalid version name");
 
+        using var publishLock = await PublishLockManager.AcquireAsync(fork, request.Version, cancel);
+
         if (VersionAlreadyExists(fork, request.Version))
             return Conflict("Version already exists");
+
+        if (PublishInProgressExists(fork, request.Version))
+            return Conflict("Version publish already in progress");
 
         logger.LogInformation("Starting one-shot publish for fork {Fork} version {Version}", fork, request.Version);
 
@@ -52,9 +58,16 @@ public sealed partial class ForkPublishController
         var versionDir = buildDirectoryManager.GetBuildVersionPath(fork, request.Version);
 
         var metadata = new VersionMetadata { Version = request.Version, EngineVersion = request.EngineVersion };
+        var versionCommitted = false;
 
         try
         {
+            if (Directory.Exists(versionDir))
+            {
+                logger.LogWarning("Deleting stale publish directory for fork {Fork} version {Version}", fork, request.Version);
+                Directory.Delete(versionDir, recursive: true);
+            }
+
             Directory.CreateDirectory(versionDir);
 
             var diskFiles = ExtractZipToVersionDir(artifacts, versionDir);
@@ -70,6 +83,7 @@ public sealed partial class ForkPublishController
                 metadata);
 
             tx.Commit();
+            versionCommitted = true;
 
             await QueueIngestJobAsync(fork);
 
@@ -80,7 +94,8 @@ public sealed partial class ForkPublishController
         catch
         {
             // Clean up after ourselves if something goes wrong.
-            Directory.Delete(versionDir, true);
+            if (!versionCommitted && Directory.Exists(versionDir))
+                Directory.Delete(versionDir, true);
 
             throw;
         }

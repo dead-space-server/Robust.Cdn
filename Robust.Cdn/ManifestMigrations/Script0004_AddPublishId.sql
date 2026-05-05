@@ -1,0 +1,2 @@
+DELETE FROM PublishInProgress;
+ALTER TABLE PublishInProgress ADD COLUMN PublishId TEXT NOT NULL DEFAULT '';

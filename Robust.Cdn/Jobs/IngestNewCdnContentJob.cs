@@ -1,5 +1,6 @@
 ﻿using System.Buffers;
 using System.IO.Compression;
+using System.Security.Cryptography;
 using System.Text;
 using Dapper;
 using Microsoft.Data.Sqlite;
@@ -16,8 +17,8 @@ namespace Robust.Cdn.Jobs;
 [DisallowConcurrentExecution]
 public sealed class IngestNewCdnContentJob(
     Database cdnDatabase,
+    ManifestDatabase manifestDatabase,
     IOptions<CdnOptions> cdnOptions,
-    IOptions<ManifestOptions> manifestOptions,
     ISchedulerFactory schedulerFactory,
     BuildDirectoryManager buildDirectoryManager,
     ILogger<IngestNewCdnContentJob> logger) : IJob
@@ -36,26 +37,33 @@ public sealed class IngestNewCdnContentJob(
 
         logger.LogInformation("Ingesting new versions for fork: {Fork}", fork);
 
-        var forkConfig = manifestOptions.Value.Forks[fork];
-
         var connection = cdnDatabase.Connection;
         var transaction = connection.BeginTransaction();
 
-        List<string> newVersions;
+        List<string> versionsToIngest;
+        List<string> versionsToMakeAvailable;
         try
         {
-            newVersions = FindNewVersions(fork, connection);
+            var forkId = EnsureForkCreated(fork, connection);
 
-            if (newVersions.Count == 0)
+            (versionsToIngest, versionsToMakeAvailable) = FindNewVersions(fork, forkId, connection);
+
+            if (versionsToIngest.Count == 0 && versionsToMakeAvailable.Count == 0)
+            {
+                await QueueManifestCacheUpdate(fork);
                 return;
+            }
 
-            IngestNewVersions(
-                fork,
-                connection,
-                newVersions,
-                ref transaction,
-                forkConfig,
-                context.CancellationToken);
+            if (versionsToIngest.Count > 0)
+            {
+                IngestNewVersions(
+                    fork,
+                    connection,
+                    versionsToIngest,
+                    ref transaction,
+                    forkId,
+                    context.CancellationToken);
+            }
 
             logger.LogDebug("Committing database");
 
@@ -66,7 +74,14 @@ public sealed class IngestNewCdnContentJob(
             transaction.Dispose();
         }
 
-        await QueueManifestAvailable(fork, newVersions);
+        if (versionsToMakeAvailable.Count > 0)
+            await QueueManifestAvailable(fork, versionsToMakeAvailable);
+    }
+
+    private async Task QueueManifestCacheUpdate(string fork)
+    {
+        var scheduler = await schedulerFactory.GetScheduler();
+        await scheduler.TriggerJob(UpdateForkManifestJob.Key, UpdateForkManifestJob.Data(fork));
     }
 
     private async Task QueueManifestAvailable(string fork, IEnumerable<string> newVersions)
@@ -82,13 +97,10 @@ public sealed class IngestNewCdnContentJob(
         SqliteConnection connection,
         List<string> newVersions,
         ref SqliteTransaction transaction,
-        ManifestForkOptions forkConfig,
+        int forkId,
         CancellationToken cancel)
     {
         var cdnOpts = cdnOptions.Value;
-        var manifestOpts = manifestOptions.Value;
-
-        var forkId = EnsureForkCreated(fork, connection);
 
         using var stmtLookupContent = connection.Handle!.Prepare("SELECT Id FROM Content WHERE Hash = ?");
         using var stmtInsertContent = connection.Handle!.Prepare(
@@ -128,6 +140,10 @@ public sealed class IngestNewCdnContentJob(
 
                 logger.LogInformation("Ingesting new version: {Version}", version);
 
+                connection.Execute(
+                    "DELETE FROM ContentVersion WHERE ForkId = @ForkId AND Version = @Version",
+                    new { ForkId = forkId, Version = version });
+
                 var versionId = connection.ExecuteScalar<long>(
                     "INSERT INTO ContentVersion (ForkId, Version, TimeAdded, ManifestHash, ManifestData, CountDistinctBlobs) " +
                     "VALUES (@ForkId, @Version, datetime('now'), zeroblob(0), zeroblob(0), 0) " +
@@ -136,10 +152,11 @@ public sealed class IngestNewCdnContentJob(
 
                 stmtInsertContentManifestEntry.BindInt64(1, versionId);
 
-                var zipFilePath = buildDirectoryManager.GetBuildVersionFilePath(
-                    fork,
-                    version,
-                    forkConfig.ClientZipName + ".zip");
+                var clientFileName = GetClientFileName(fork, version);
+                if (!IsSafeFileName(clientFileName))
+                    throw new InvalidDataException($"Unsafe client file name in manifest DB: {clientFileName}");
+
+                var zipFilePath = buildDirectoryManager.GetBuildVersionFilePath(fork, version, clientFileName);
 
                 using var zipFile = ZipFile.OpenRead(zipFilePath);
 
@@ -333,47 +350,144 @@ public sealed class IngestNewCdnContentJob(
         }
     }
 
-    private List<string> FindNewVersions(string fork, SqliteConnection con)
+    private (List<string> versionsToIngest, List<string> versionsToMakeAvailable) FindNewVersions(
+        string fork,
+        int forkId,
+        SqliteConnection con)
     {
-        using var stmtCheckVersion = con.Handle!.Prepare("SELECT 1 FROM ContentVersion WHERE Version = ?");
+        using var stmtCheckVersion = con.Handle!.Prepare(
+            "SELECT 1 FROM ContentVersion WHERE ForkId = ? AND Version = ?");
 
-        var newVersions = new List<(string, DateTime)>();
+        var versionsToIngest = new List<(string, DateTime)>();
+        var versionsToMakeAvailable = new List<(string, DateTime)>();
 
-        var dir = buildDirectoryManager.GetForkPath(fork);
-        if (!Directory.Exists(dir))
-            return [];
+        var versions = manifestDatabase.Connection.Query<(string name, DateTime publishedTime, bool available, string clientFileName, byte[] clientSha256)>(
+            """
+            SELECT ForkVersion.Name, ForkVersion.PublishedTime, ForkVersion.Available, ForkVersion.ClientFileName, ForkVersion.ClientSha256
+            FROM ForkVersion
+            INNER JOIN Fork ON Fork.Id = ForkVersion.ForkId
+            WHERE Fork.Name = @Fork
+            """,
+            new { Fork = fork });
 
-        foreach (var versionDirectory in Directory.EnumerateDirectories(dir))
+        foreach (var (version, publishedTime, available, clientFileName, clientSha256) in versions)
         {
-            var createdTime = Directory.GetLastWriteTime(versionDirectory);
-            var version = Path.GetFileName(versionDirectory);
+            var versionDirectory = buildDirectoryManager.GetBuildVersionPath(fork, version);
 
-            logger.LogTrace("Found version directory: {VersionDir}, write time: {WriteTime}", versionDirectory,
-                createdTime);
+            logger.LogTrace("Found manifest version: {Version}, publish time: {PublishedTime}", version,
+                publishedTime);
 
             stmtCheckVersion.Reset();
-            stmtCheckVersion.BindString(1, version);
+            stmtCheckVersion.BindInt(1, forkId);
+            stmtCheckVersion.BindString(2, version);
 
-            if (stmtCheckVersion.Step() == raw.SQLITE_ROW)
+            var hasContentVersion = stmtCheckVersion.Step() == raw.SQLITE_ROW;
+            stmtCheckVersion.Reset();
+
+            if (hasContentVersion && available)
             {
                 // Already have version, skip.
                 logger.LogTrace("Already have version: {Version}", version);
                 continue;
             }
 
-            var clientZipName = manifestOptions.Value.Forks[fork].ClientZipName + ".zip";
+            if (!IsSafeFileName(clientFileName))
+            {
+                logger.LogError("Manifest DB client file name is unsafe for version {Version}: {ClientFileName}", version, clientFileName);
+                continue;
+            }
 
-            if (!File.Exists(Path.Combine(versionDirectory, clientZipName)))
+            var clientZipPath = Path.Combine(versionDirectory, clientFileName);
+
+            if (!File.Exists(clientZipPath))
             {
                 logger.LogWarning("On-disk version is missing client zip: {Version}", version);
                 continue;
             }
 
-            newVersions.Add((version, createdTime));
+            using (var clientZip = File.OpenRead(clientZipPath))
+            {
+                var diskHash = SHA256.HashData(clientZip);
+                if (!diskHash.AsSpan().SequenceEqual(clientSha256))
+                {
+                    logger.LogError("On-disk client zip hash mismatch for version {Version}; skipping ingest", version);
+                    continue;
+                }
+            }
+
+            if (!ServerBuildsValid(fork, version))
+                continue;
+
+            if (hasContentVersion)
+                logger.LogWarning("Re-ingesting unavailable content version: {Version}", version);
+
+            versionsToIngest.Add((version, publishedTime));
+            if (!available)
+                versionsToMakeAvailable.Add((version, publishedTime));
             logger.LogTrace("Found new version: {Version}", version);
         }
 
-        return newVersions.OrderByDescending(x => x.Item2).Select(x => x.Item1).ToList();
+        return (
+            versionsToIngest.OrderByDescending(x => x.Item2).Select(x => x.Item1).ToList(),
+            versionsToMakeAvailable.OrderByDescending(x => x.Item2).Select(x => x.Item1).ToList());
+    }
+
+    private string GetClientFileName(string fork, string version)
+    {
+        return manifestDatabase.Connection.QuerySingle<string>("""
+            SELECT ForkVersion.ClientFileName
+            FROM ForkVersion
+            INNER JOIN Fork ON Fork.Id = ForkVersion.ForkId
+            WHERE Fork.Name = @Fork
+              AND ForkVersion.Name = @Version
+            """,
+            new { Fork = fork, Version = version });
+    }
+
+    private bool ServerBuildsValid(string fork, string version)
+    {
+        var serverBuilds = manifestDatabase.Connection.Query<(string fileName, byte[] sha256)>("""
+            SELECT ForkVersionServerBuild.FileName, ForkVersionServerBuild.Sha256
+            FROM ForkVersionServerBuild
+            INNER JOIN ForkVersion ON ForkVersion.Id = ForkVersionServerBuild.ForkVersionId
+            INNER JOIN Fork ON Fork.Id = ForkVersion.ForkId
+            WHERE Fork.Name = @Fork
+              AND ForkVersion.Name = @Version
+            """,
+            new { Fork = fork, Version = version });
+
+        foreach (var (fileName, sha256) in serverBuilds)
+        {
+            if (!IsSafeFileName(fileName))
+            {
+                logger.LogError("Manifest DB server file name is unsafe for version {Version}: {FileName}", version, fileName);
+                return false;
+            }
+
+            var path = buildDirectoryManager.GetBuildVersionFilePath(fork, version, fileName);
+            if (!File.Exists(path))
+            {
+                logger.LogWarning("On-disk version is missing server zip: {Version} {FileName}", version, fileName);
+                return false;
+            }
+
+            using var file = File.OpenRead(path);
+            var diskHash = SHA256.HashData(file);
+            if (!diskHash.AsSpan().SequenceEqual(sha256))
+            {
+                logger.LogError("On-disk server zip hash mismatch for version {Version} file {FileName}; skipping ingest", version, fileName);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsSafeFileName(string fileName)
+    {
+        return !string.IsNullOrEmpty(fileName)
+               && fileName == Path.GetFileName(fileName)
+               && fileName.IndexOfAny(new[] { '/', '\\' }) == -1;
     }
 
     private static int EnsureForkCreated(string fork, SqliteConnection connection)

@@ -58,17 +58,22 @@ public sealed class MakeNewManifestVersionsAvailableJob(
         {
             logger.LogInformation("New available version: {Version}", version);
 
-            database.Connection.Execute("""
+            var updated = database.Connection.Execute("""
                 UPDATE ForkVersion
-                SET Available = TRUE
+                SET Available = TRUE,
+                    NotifyPending = TRUE
                 WHERE Name = @Name
                   AND ForkId = @ForkId
+                  AND NOT Available
                 """,
                 new
                 {
                     Name = version,
                     ForkId = forkId
                 });
+
+            if (updated == 0)
+                logger.LogDebug("Version was already available or no longer exists: {Version}", version);
         }
     }
 }

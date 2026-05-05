@@ -19,6 +19,7 @@ namespace Robust.Cdn.Controllers;
 [Route("/fork/{fork}/version/{version}")]
 public sealed class DownloadController(
     Database db,
+    ManifestDatabase manifestDatabase,
     ILogger<DownloadController> logger,
     IOptionsSnapshot<CdnOptions> options,
     DownloadRequestLogger requestLogger)
@@ -33,6 +34,9 @@ public sealed class DownloadController(
     [HttpGet("manifest")]
     public IActionResult GetManifest(string fork, string version)
     {
+        if (!CanDownloadVersion(fork, version))
+            return NotFound();
+
         var con = db.Connection;
         con.BeginTransaction(deferred: true);
 
@@ -85,6 +89,9 @@ public sealed class DownloadController(
     [HttpPost("download")]
     public async Task<IActionResult> Download(string fork, string version)
     {
+        if (!CanDownloadVersion(fork, version))
+            return NotFound();
+
         if (Request.ContentType != "application/octet-stream")
             return BadRequest("Must specify application/octet-stream Content-Type");
 
@@ -126,6 +133,8 @@ public sealed class DownloadController(
         await Request.Body.CopyToAsync(buffer);
 
         var buf = buffer.GetBuffer().AsMemory(0, (int)buffer.Position);
+        if (buf.Length % 4 != 0)
+            return BadRequest("Malformed download request");
 
         var bits = new BitArray(entriesCount);
         var offset = 0;
@@ -205,7 +214,7 @@ public sealed class DownloadController(
 
         var fileHeader = new byte[fileHeaderSize];
 
-        await using (outStream)
+            await using (outStream)
         {
             var streamHeader = new byte[4];
             DownloadStreamHeaderFlags streamHeaderFlags = 0;
@@ -217,7 +226,6 @@ public sealed class DownloadController(
             await outStream.WriteAsync(streamHeader);
 
             SqliteBlobStream? blob = null;
-            ZStdDecompressStream? decompress = null;
 
             try
             {
@@ -257,15 +265,12 @@ public sealed class DownloadController(
                     if (blob == null)
                     {
                         blob = SqliteBlobStream.Open(con.Handle!, "main", "Content", "Data", rowId, false);
-                        if (!preCompressed)
-                            decompress = new ZStdDecompressStream(blob, ownStream: false);
                     }
                     else
                     {
                         blob.Reopen(rowId);
                     }
 
-                    Stream copyFromStream = blob;
                     if (preCompressed)
                     {
                         // If we are doing pre-compression, just write the DB contents directly.
@@ -273,15 +278,19 @@ public sealed class DownloadController(
                             fileHeader.AsSpan(4, 4),
                             compression == ContentCompression.ZStd ? (int)blob.Length : 0);
                     }
-                    else if (compression == ContentCompression.ZStd)
-                    {
-                        // If we are not doing pre-compression but the DB entry is compressed, we have to decompress!
-                        copyFromStream = decompress!;
-                    }
 
                     await outStream.WriteAsync(fileHeader);
 
-                    await copyFromStream.CopyToAsync(outStream);
+                    if (!preCompressed && compression == ContentCompression.ZStd)
+                    {
+                        // If we are not doing pre-compression but the DB entry is compressed, we have to decompress.
+                        using var localDecompress = new ZStdDecompressStream(blob, ownStream: false);
+                        await localDecompress.CopyToAsync(outStream);
+                    }
+                    else
+                    {
+                        await blob.CopyToAsync(outStream);
+                    }
 
                     offset += 4;
                     count += 1;
@@ -295,7 +304,6 @@ public sealed class DownloadController(
             finally
             {
                 blob?.Dispose();
-                decompress?.Dispose();
             }
         }
 
@@ -317,6 +325,33 @@ public sealed class DownloadController(
         }
 
         return new NoOpActionResult();
+    }
+
+    private bool CanDownloadVersion(string fork, string version)
+    {
+        var available = manifestDatabase.Connection.QuerySingleOrDefault<bool?>("""
+            SELECT 1
+            FROM ForkVersion
+            INNER JOIN Fork ON Fork.Id = ForkVersion.ForkId
+            WHERE Fork.Name = @Fork
+              AND ForkVersion.Name = @Version
+              AND ForkVersion.Available
+            """,
+            new { Fork = fork, Version = version });
+
+        if (available == true)
+            return true;
+
+        var versionExistsButUnavailable = manifestDatabase.Connection.QuerySingleOrDefault<bool>("""
+            SELECT 1
+            FROM ForkVersion
+            INNER JOIN Fork ON Fork.Id = ForkVersion.ForkId
+            WHERE Fork.Name = @Fork
+              AND ForkVersion.Name = @Version
+            """,
+            new { Fork = fork, Version = version });
+
+        return !versionExistsButUnavailable;
     }
 
     // TODO: Crappy Accept-Encoding parser

@@ -160,7 +160,7 @@ public sealed class DownloadReader : IDisposable
         if (size > buffer.Length)
             throw new ArgumentException("Provided buffer is not large enough to fit entire data size");
 
-        await _stream.ReadExactlyAsync(buffer, cancel);
+        await _stream.ReadExactlyAsync(buffer[..size], cancel);
 
         _state = State.ReadFileHeader;
     }
@@ -174,14 +174,19 @@ public sealed class DownloadReader : IDisposable
             // TODO: Buffering can be avoided here.
             var compressedBuffer = ArrayPool<byte>.Shared.Rent(_currentHeader.CompressedLength);
 
-            await _stream.ReadExactlyAsync(compressedBuffer, cancel);
+            try
+            {
+                await _stream.ReadExactlyAsync(compressedBuffer.AsMemory(0, _currentHeader.CompressedLength), cancel);
 
-            var ms = new MemoryStream(compressedBuffer, writable: false);
-            await using var decompress = new ZstdDecodeStream(ms, false);
+                var ms = new MemoryStream(compressedBuffer, 0, _currentHeader.CompressedLength, writable: false);
+                await using var decompress = new ZstdDecodeStream(ms, false);
 
-            await decompress.CopyToAsync(destination, cancel);
-
-            ArrayPool<byte>.Shared.Return(compressedBuffer);
+                await decompress.CopyToAsync(destination, cancel);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(compressedBuffer);
+            }
         }
         else
         {

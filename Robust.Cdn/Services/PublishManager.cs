@@ -22,6 +22,14 @@ public sealed class PublishManager(
                 )
             """, new { Version = version, Fork = fork }, tx);
 
+        if (!IsSafePathSegment(fork) || !IsSafePathSegment(version))
+        {
+            logger.LogWarning("Skipping publish directory cleanup with unsafe path segment for fork {Fork} version {Version}", fork, version);
+            if (commit)
+                tx.Commit();
+            return;
+        }
+
         // Delete directory on disk.
         var versionDir = buildDirectoryManager.GetBuildVersionPath(fork, version);
         if (Directory.Exists(versionDir))
@@ -29,5 +37,15 @@ public sealed class PublishManager(
 
         if (commit)
             tx.Commit();
+    }
+
+    private static bool IsSafePathSegment(string segment)
+    {
+        return !string.IsNullOrWhiteSpace(segment)
+               && !Path.IsPathRooted(segment)
+               && !segment.Contains('/')
+               && !segment.Contains('\\')
+               && segment != "."
+               && segment != "..";
     }
 }

@@ -66,6 +66,22 @@ public sealed partial class ForkPublishController(
             });
     }
 
+    private bool PublishInProgressExists(string fork, string version)
+    {
+        return manifestDatabase.Connection.QuerySingleOrDefault<bool>(
+            """
+            SELECT 1
+            FROM Fork, PublishInProgress
+            WHERE Fork.Id = PublishInProgress.ForkId
+              AND Fork.Name = @ForkName
+              AND PublishInProgress.Version = @ForkVersion
+            """, new
+            {
+                ForkName = fork,
+                ForkVersion = version
+            });
+    }
+
     private List<(T key, Artifact artifact)> ClassifyEntries<T>(
         ManifestForkOptions forkConfig,
         IEnumerable<T> items,
@@ -128,6 +144,7 @@ public sealed partial class ForkPublishController(
         var hash = Convert.ToHexString(SHA256.HashData(file));
 
         // Hash manifest
+        file.Position = 0;
         var manifestHash = Convert.ToHexString(GenerateManifestHash(file));
 
         logger.LogDebug("Client zip hash is {ZipHash}, manifest hash is {ManifestHash}", hash, manifestHash);
@@ -304,10 +321,10 @@ public sealed partial class ForkPublishController(
     }
 
     // File cannot start with a dot but otherwise most shit is fair game.
-    [GeneratedRegex(@"[a-zA-Z0-9\-_][a-zA-Z0-9\-_.]*")]
+    [GeneratedRegex(@"^[a-zA-Z0-9\-_][a-zA-Z0-9\-_.]*$")]
     private static partial Regex ValidVersionRegexBuilder();
 
-    [GeneratedRegex(@"[a-zA-Z0-9\-_][a-zA-Z0-9\-_.]*")]
+    [GeneratedRegex(@"^[a-zA-Z0-9\-_][a-zA-Z0-9\-_.]*$")]
     private static partial Regex ValidFileRegexBuilder();
 
     private sealed class Artifact

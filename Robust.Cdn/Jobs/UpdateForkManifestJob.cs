@@ -9,6 +9,7 @@ namespace Robust.Cdn.Jobs;
 /// <summary>
 /// Updates the cached server manifest for a fork.
 /// </summary>
+[DisallowConcurrentExecution]
 public sealed class UpdateForkManifestJob(
     ManifestDatabase database,
     BaseUrlManager baseUrlManager,
@@ -44,8 +45,22 @@ public sealed class UpdateForkManifestJob(
 
         UpdateServerManifestCache(fork, forkId);
 
-        if (notifyUpdate)
+        var shouldNotify = notifyUpdate || HasPendingNotify(forkId);
+        if (shouldNotify)
+        {
             await QueueNotifyWatchdogUpdate(fork);
+        }
+    }
+
+    private bool HasPendingNotify(int forkId)
+    {
+        return database.Connection.QuerySingleOrDefault<bool>("""
+            SELECT 1
+            FROM ForkVersion
+            WHERE ForkId = @ForkId
+              AND NotifyPending
+            """,
+            new { ForkId = forkId });
     }
 
     private void UpdateServerManifestCache(string fork, int forkId)

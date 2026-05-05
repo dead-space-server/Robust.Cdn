@@ -9,6 +9,7 @@ namespace Robust.Cdn.Controllers;
 [Route("/version/{version}")]
 public sealed class DownloadCompatibilityController(
     Database db,
+    ManifestDatabase manifestDatabase,
     ILogger<DownloadController> logger,
     IOptionsSnapshot<CdnOptions> cdnOptions,
     DownloadRequestLogger requestLogger) : ControllerBase
@@ -42,7 +43,7 @@ public sealed class DownloadCompatibilityController(
 
     private DownloadController GetDownloadController()
     {
-        return new DownloadController(db, logger, cdnOptions, requestLogger)
+        return new DownloadController(db, manifestDatabase, logger, cdnOptions, requestLogger)
         {
             ControllerContext = ControllerContext
         };

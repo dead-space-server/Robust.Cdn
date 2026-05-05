@@ -33,6 +33,8 @@ public sealed class ForkManifestController(
         if (rowId == 0)
             return NotFound();
 
+        Response.Headers.CacheControl = "no-store";
+
         var stream = SqliteBlobStream.Open(
             database.Connection.Handle!,
             "main",
@@ -51,7 +53,7 @@ public sealed class ForkManifestController(
         string file)
     {
         // Just safety shit here.
-        if (file.Contains('/') || file == ".." || file == ".")
+        if (file.Contains('/') || file.Contains('\\') || file == ".." || file == ".")
             return BadRequest();
 
         if (!TryCheckBasicAuth(fork, out var errorResult))
@@ -61,6 +63,7 @@ public sealed class ForkManifestController(
             SELECT 1
             FROM ForkVersion, Fork
             WHERE ForkVersion.Name = @Version
+              AND ForkVersion.Available
               AND Fork.Name = @Fork
               AND Fork.Id = ForkVersion.ForkId
             """, new { Fork = fork, Version = version });

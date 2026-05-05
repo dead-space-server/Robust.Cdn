@@ -39,7 +39,7 @@ builder.Services.AddQuartz(q =>
         schedule.RepeatForever().WithIntervalInHours(24);
     }));
     q.ScheduleJob<DeleteInProgressPublishesJob>(t =>
-        t.WithSimpleSchedule(s => s.RepeatForever().WithIntervalInHours(24)));
+        t.WithSimpleSchedule(s => s.RepeatForever().WithIntervalInMinutes(5)));
 });
 
 builder.Services.AddQuartzHostedService(q =>
@@ -120,6 +120,7 @@ app.Lifetime.ApplicationStopped.Register(SqliteConnection.ClearAllPools);
     var scheduler = await initScope.ServiceProvider.GetRequiredService<ISchedulerFactory>().GetScheduler();
     foreach (var fork in manifestOptions.Forks.Keys)
     {
+        await scheduler.TriggerJob(UpdateForkManifestJob.Key, UpdateForkManifestJob.Data(fork));
         await scheduler.TriggerJob(IngestNewCdnContentJob.Key, IngestNewCdnContentJob.Data(fork));
     }
 }

@@ -1,6 +1,7 @@
 using Dapper;
 using Microsoft.AspNetCore.Mvc;
 using Robust.Cdn.Helpers;
+using Robust.Cdn.Services;
 
 namespace Robust.Cdn.Controllers;
 
@@ -23,6 +24,8 @@ public sealed partial class ForkPublishController
         if (!ValidVersionRegex.IsMatch(request.Version))
             return BadRequest("Invalid version name");
 
+        using var publishLock = await PublishLockManager.AcquireAsync(fork, request.Version, cancel);
+
         if (VersionAlreadyExists(fork, request.Version))
             return Conflict("Version already exists");
 
@@ -38,29 +41,37 @@ public sealed partial class ForkPublishController
             new { request.Version, ForkId = forkId });
         if (hasExistingPublish)
         {
-            // If a publish with this name already exists we abort it and start again.
-            // We do this so you can "just" retry a mid-way-failed publish without an extra API call required.
-
-            logger.LogWarning("Already had an in-progress publish for this version, aborting it and restarting.");
-            publishManager.AbortMultiPublish(fork, request.Version, tx, commit: false);
+            logger.LogWarning("Publish already in progress for fork {Fork} version {Version}", fork, request.Version);
+            return Conflict("Version publish already in progress");
         }
 
+        var publishId = Guid.NewGuid().ToString("N");
+
         await dbCon.ExecuteAsync("""
-            INSERT INTO PublishInProgress (Version, ForkId, StartTime, EngineVersion)
-            VALUES (@Version, @ForkId, @StartTime, @EngineVersion)
+            INSERT INTO PublishInProgress (Version, ForkId, StartTime, EngineVersion, PublishId)
+            VALUES (@Version, @ForkId, @StartTime, @EngineVersion, @PublishId)
             """,
             new
             {
                 request.Version,
                 request.EngineVersion,
+                PublishId = publishId,
                 ForkId = forkId,
                 StartTime = DateTime.UtcNow
             });
 
         var versionDir = buildDirectoryManager.GetBuildVersionPath(fork, request.Version);
+        if (Directory.Exists(versionDir))
+        {
+            logger.LogWarning("Deleting stale publish directory for fork {Fork} version {Version}", fork, request.Version);
+            Directory.Delete(versionDir, recursive: true);
+        }
+
         Directory.CreateDirectory(versionDir);
 
         await tx.CommitAsync(cancel);
+
+        Response.Headers["Robust-Cdn-Publish-Id"] = publishId;
 
         logger.LogInformation("Multi publish initiated. Waiting for subsequent API requests...");
 
@@ -75,6 +86,8 @@ public sealed partial class ForkPublishController
         string fileName,
         [FromHeader(Name = "Robust-Cdn-Publish-Version")]
         string version,
+        [FromHeader(Name = "Robust-Cdn-Publish-Id")]
+        string publishId,
         CancellationToken cancel)
     {
         if (!authHelper.IsAuthValid(fork, out _, out var failureResult))
@@ -82,6 +95,14 @@ public sealed partial class ForkPublishController
 
         if (!ValidFileRegex.IsMatch(fileName))
             return BadRequest("Invalid artifact file name");
+
+        if (!ValidVersionRegex.IsMatch(version))
+            return BadRequest("Invalid version name");
+
+        if (string.IsNullOrWhiteSpace(publishId))
+            return BadRequest("Missing publish id");
+
+        using var publishLock = await PublishLockManager.AcquireAsync(fork, version, cancel);
 
         var dbCon = manifestDatabase.Connection;
         await using var tx = await dbCon.BeginTransactionAsync(cancel);
@@ -91,23 +112,47 @@ public sealed partial class ForkPublishController
             SELECT Id
             FROM PublishInProgress
             WHERE Version = @Name AND ForkId = @Fork
+              AND PublishId = @PublishId
             """,
-            new { Name = version, Fork = forkId });
+            new { Name = version, Fork = forkId, PublishId = publishId });
 
         if (versionId == null)
             return NotFound("Unknown in-progress version");
 
         var versionDir = buildDirectoryManager.GetBuildVersionPath(fork, version);
         var filePath = Path.Combine(versionDir, fileName);
+        var tempFilePath = Path.Combine(versionDir, $".{fileName}.{Guid.NewGuid():N}.tmp");
 
         if (System.IO.File.Exists(filePath))
             return Conflict("File already published");
 
         logger.LogDebug("Receiving file {FileName} for multi-publish version {Version}", fileName, version);
 
-        await using var file = System.IO.File.Create(filePath, 4096, FileOptions.Asynchronous);
+        try
+        {
+            await using (var file = System.IO.File.Create(tempFilePath, 4096, FileOptions.Asynchronous))
+            {
+                await Request.Body.CopyToAsync(file, cancel);
+                await file.FlushAsync(cancel);
+            }
 
-        await Request.Body.CopyToAsync(file, cancel);
+            try
+            {
+                System.IO.File.Move(tempFilePath, filePath);
+            }
+            catch (IOException) when (System.IO.File.Exists(filePath))
+            {
+                System.IO.File.Delete(tempFilePath);
+                return Conflict("File already published");
+            }
+        }
+        catch
+        {
+            if (System.IO.File.Exists(tempFilePath))
+                System.IO.File.Delete(tempFilePath);
+
+            throw;
+        }
 
         logger.LogDebug("Successfully Received file {FileName}", fileName);
 
@@ -118,10 +163,20 @@ public sealed partial class ForkPublishController
     public async Task<IActionResult> MultiPublishFinish(
         string fork,
         [FromBody] PublishFinishRequest request,
+        [FromHeader(Name = "Robust-Cdn-Publish-Id")]
+        string publishId,
         CancellationToken cancel)
     {
         if (!authHelper.IsAuthValid(fork, out var forkConfig, out var failureResult))
             return failureResult;
+
+        if (!ValidVersionRegex.IsMatch(request.Version))
+            return BadRequest("Invalid version name");
+
+        if (string.IsNullOrWhiteSpace(publishId))
+            return BadRequest("Missing publish id");
+
+        using var publishLock = await PublishLockManager.AcquireAsync(fork, request.Version, cancel);
 
         var dbCon = manifestDatabase.Connection;
         await using var tx = await dbCon.BeginTransactionAsync(cancel);
@@ -131,8 +186,9 @@ public sealed partial class ForkPublishController
             SELECT Version, EngineVersion
             FROM PublishInProgress
             WHERE Version = @Name AND ForkId = @Fork
+              AND PublishId = @PublishId
             """,
-            new { Name = request.Version, Fork = forkId });
+            new { Name = request.Version, Fork = forkId, PublishId = publishId });
 
         if (versionMetadata == null)
             return NotFound("Unknown in-progress version");
@@ -163,14 +219,55 @@ public sealed partial class ForkPublishController
         AddVersionToDatabase(clientArtifact.Value.artifact, diskFiles, fork, versionMetadata);
 
         dbCon.Execute(
-            "DELETE FROM PublishInProgress WHERE Version = @Name AND ForkId = @Fork",
-            new { Name = request.Version, Fork = forkId });
+            "DELETE FROM PublishInProgress WHERE Version = @Name AND ForkId = @Fork AND PublishId = @PublishId",
+            new { Name = request.Version, Fork = forkId, PublishId = publishId });
 
         tx.Commit();
 
         await QueueIngestJobAsync(fork);
 
         logger.LogInformation("Publish succeeded!");
+
+        return NoContent();
+    }
+
+    [HttpPost("abort")]
+    public async Task<IActionResult> MultiPublishAbort(
+        string fork,
+        [FromBody] PublishFinishRequest request,
+        [FromHeader(Name = "Robust-Cdn-Publish-Id")]
+        string publishId,
+        CancellationToken cancel)
+    {
+        if (!authHelper.IsAuthValid(fork, out _, out var failureResult))
+            return failureResult;
+
+        if (!ValidVersionRegex.IsMatch(request.Version))
+            return BadRequest("Invalid version name");
+
+        if (string.IsNullOrWhiteSpace(publishId))
+            return BadRequest("Missing publish id");
+
+        using var publishLock = await PublishLockManager.AcquireAsync(fork, request.Version, cancel);
+
+        var dbCon = manifestDatabase.Connection;
+        await using var tx = await dbCon.BeginTransactionAsync(cancel);
+
+        var forkId = dbCon.QuerySingle<int>("SELECT Id FROM Fork WHERE Name = @Name", new { Name = fork });
+        var hasPublish = dbCon.QuerySingleOrDefault<bool>("""
+            SELECT 1
+            FROM PublishInProgress
+            WHERE Version = @Name
+              AND ForkId = @Fork
+              AND PublishId = @PublishId
+            """,
+            new { Name = request.Version, Fork = forkId, PublishId = publishId });
+
+        if (!hasPublish)
+            return NotFound("Unknown in-progress version");
+
+        publishManager.AbortMultiPublish(fork, request.Version, tx, commit: false);
+        await tx.CommitAsync(cancel);
 
         return NoContent();
     }
