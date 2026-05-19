@@ -2,6 +2,8 @@
 
 ## Master
 
+* Old manifest build pruning now also removes matching client CDN content and unreferenced blobs from `content.db`.
+
 ## 2.2.0
 
 * Added new multi-request publishing workflow.

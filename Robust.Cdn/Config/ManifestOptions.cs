@@ -41,11 +41,11 @@ public sealed class ManifestForkOptions
     public Dictionary<string, string> PrivateUsers { get; set; } = new();
 
     /// <summary>
-    /// If set to a value other than 0, old manifest versions will be automatically deleted after this many days.
+    /// If set to a value greater than 0, old versions will be automatically deleted after this many days.
     /// </summary>
     /// <remarks>
-    /// This does not delete these old versions from the client CDN, only the server manifest.
-    /// This is seen as acceptable as those generally don't take too much space.
+    /// This deletes old server manifest versions, their server build files and their matching client CDN content.
+    /// Deduplicated CDN blobs are deleted once no retained content version references them.
     /// </remarks>
     public int PruneBuildsDays { get; set; } = 90;
 
