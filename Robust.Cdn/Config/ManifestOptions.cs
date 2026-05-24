@@ -47,7 +47,7 @@ public sealed class ManifestForkOptions
     /// This deletes old server manifest versions, their server build files and their matching client CDN content.
     /// Deduplicated CDN blobs are deleted once no retained content version references them.
     /// </remarks>
-    public int PruneBuildsDays { get; set; } = 90;
+    public int PruneBuildsDays { get; set; } = 1;
 
     public string? DisplayName { get; set; }
     public string? BuildsPageLink { get; set; }
